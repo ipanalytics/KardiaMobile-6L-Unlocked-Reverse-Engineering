@@ -85,7 +85,9 @@ python3 tools/kardia_ble.py --scan          # find the device: name + address ty
 python3 tools/kardia_ble.py --auto          # bond, unlock, record 60 s, write ECG files
 ```
 
-`--simulate` generates a synthetic ECG for plumbing tests. It is deliberately marked in the output and in the filenames so it can never be mistaken for a real measurement.
+`--out DIR` picks where the files land (the current directory by default), `--raw` keeps
+the raw notification bytes next to the CSV for protocol work, and `--wait SEC` sets how
+long `--auto` keeps scanning for the device.
 
 Every session produces:
 

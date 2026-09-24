@@ -16,12 +16,14 @@ indications on the control characteristic and notifications on the stream one.
 Modes:
   --scan                 list nearby devices (name, address, RSSI)
   --capture SEC          record SEC seconds and write the files
-  --auto                 wait for electrode contact, record a session, send the result
-  --simulate SEC         run without hardware: synthetic stream through the same path
+  --auto                 wait for electrode contact, record one session
+  --out DIR              where to write the files (default: current directory)
+  --wait SEC             how long to wait for the device in --auto (default 1800)
+  --raw                  also keep the raw notification bytes (.bin) next to the CSV
   --selftest             check packet parsing and lead derivation
 
-Output files go to the KARDIA_DIR directory (CSV + PNG + PDF), metrics can be posted
-to a webhook, the file goes to Telegram. Settings come from the KARDIA_ENV file.
+Output: <stamp>.csv with all six leads, <stamp>.png and <stamp>.pdf next to it.
+No account, no cloud, no vendor app — the data never leaves the machine.
 """
 from __future__ import annotations
 
@@ -29,14 +31,9 @@ import argparse
 import asyncio
 import csv
 import hashlib
-import json
-import math
-import os
-import random
 import subprocess
 import sys
 import time
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,13 +43,11 @@ CHAR_ECG = "ac060003-328c-a28f-9846-5a8aa212661b"
 SAMPLE_RATE = 300
 PACKET_BYTES = 36
 SAMPLES_PER_PACKET = 9
-DATA_DIR = Path(os.environ.get("KARDIA_DIR", "kardia_data"))
-ENV_FILE = Path(os.environ.get("KARDIA_ENV", "telegram.env"))
-# Live session: treat the electrodes as untouched when a packet's spread is below this.
-ACTIVITY_THRESHOLD = float(os.environ.get("KARDIA_ACTIVITY", "150"))
-FLAT_STOP_SECONDS = float(os.environ.get("KARDIA_FLAT_STOP", "6"))
-MIN_SESSION_SECONDS = float(os.environ.get("KARDIA_MIN_SESSION", "10"))
-MAX_SESSION_SECONDS = float(os.environ.get("KARDIA_MAX_SESSION", "60"))
+# A packet whose spread is below this means the electrodes are not touched.
+ACTIVITY_THRESHOLD = 150.0
+FLAT_STOP_SECONDS = 6.0
+MIN_SESSION_SECONDS = 10.0
+MAX_SESSION_SECONDS = 60.0
 
 
 # ────────────────────────── protocol ──────────────────────────
@@ -69,9 +64,9 @@ def command_for_mode(device_name: str, mode: str = "M2") -> str:
 def decode_m2(payload: bytes) -> list[tuple[int, int]]:
     """ECG stream -> (channel1, channel2) int16 little-endian pairs.
 
-    Taken from the device HCI capture: a notification arrives in 20-byte chunks
-    (MTU 23), that is 5 pairs, not 9. So the length is not fixed here: cut by
-    4 bytes and let the caller keep an incomplete tail in its buffer.
+    From the device capture a notification arrives in 20-byte chunks (MTU 23),
+    that is 5 pairs, not 9, so the length is not fixed here: cut by 4 bytes and
+    let the caller keep an incomplete tail in its buffer.
     """
     cut = len(payload) // 4 * 4
     out = []
@@ -103,13 +98,12 @@ def read_metrics(channels: dict[str, list[float]]) -> tuple[dict, str]:
         return {}, "numpy is missing — heart-rate estimate skipped"
     x = np.asarray(lead_ii, dtype=float)
     x = x - np.mean(x)
-    # simple 5-18 Hz band-pass through FFT
     spec = np.fft.rfft(x)
     freqs = np.fft.rfftfreq(len(x), 1.0 / SAMPLE_RATE)
     spec[(freqs < 5) | (freqs > 18)] = 0
     y = np.fft.irfft(spec, n=len(x))
-    d = np.diff(y)
-    energy = np.convolve(d ** 2, np.ones(int(0.12 * SAMPLE_RATE)) / (0.12 * SAMPLE_RATE), mode="same")
+    energy = np.convolve(np.diff(y) ** 2, np.ones(int(0.12 * SAMPLE_RATE)) / (0.12 * SAMPLE_RATE),
+                         mode="same")
     thr = 3.0 * float(np.median(energy))
     peaks, last = [], -SAMPLE_RATE
     for idx in range(1, len(energy) - 1):
@@ -124,21 +118,18 @@ def read_metrics(channels: dict[str, list[float]]) -> tuple[dict, str]:
     if len(rr) < 3:
         return {}, "intervals outside a sane range — no estimate given"
     bpm = 60.0 / float(np.median(rr))
-    # variability: SDNN over normal intervals, reference only
     sdnn = float(np.std(rr)) * 1000.0
-    irregular = "yes" if sdnn > 200 else "no"
     metrics = {
         "heart_rate": round(bpm, 1),
         "hrv": round(sdnn, 1),
         "ecg_beats": len(peaks),
         "ecg_seconds": round(len(lead_ii) / SAMPLE_RATE, 1),
     }
-    text = (f"heart rate about {bpm:.0f} bpm from {len(peaks)} complexes, "
-            f"SDNN {sdnn:.0f} ms (marked irregularity: {irregular})")
+    text = (f"heart rate about {bpm:.0f} bpm from {len(peaks)} complexes, SDNN {sdnn:.0f} ms")
     return metrics, text
 
 
-# ────────────────────────── recording and output ──────────────────────────
+# ────────────────────────── output ──────────────────────────
 def write_csv(channels: dict[str, list[float]], path: Path, source: str = "kardia-ble") -> None:
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     with path.open("w", newline="") as f:
@@ -200,83 +191,18 @@ def write_svg(channels: dict[str, list[float]], path: Path) -> str:
     return str(path)
 
 
-def post_metrics(metrics: dict) -> str:
-    if not metrics:
-        return "no metrics to post"
-    payload = {"source": os.environ.get("KARDIA_SOURCE", "kardia-ble"),
-               "metrics": [{"metric": k, "value": v, "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-                           for k, v in metrics.items()]}
-    url = os.environ.get("KARDIA_WEBHOOK_URL", "")
-    if not url:
-        return "no webhook URL set — metrics stay in the files"
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
-    try:
-        return urllib.request.urlopen(req, timeout=25).read().decode()[:200]
-    except Exception as e:
-        return f"webhook refused: {e}"
-
-
-def load_env() -> dict:
-    env = {}
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip().strip('"\'')
-    return env
-
-
-def send_telegram(path: Path, caption: str) -> str:
-    if os.environ.get("KARDIA_NO_SEND") == "1":
-        return "Telegram sending disabled (KARDIA_NO_SEND=1)"
-    env = load_env()
-    token, chat = env.get("TG_BOT_TOKEN", ""), env.get("TG_CHAT_ID", "")
-    if not token or not chat:
-        return "Telegram is not configured (no telegram.env) — file kept locally"
-    boundary = "----kardia" + hashlib.md5(str(time.time()).encode()).hexdigest()[:12]
-
-    def part(head: str, data: bytes) -> bytes:
-        return (f"--{boundary}\r\n{head}\r\n\r\n").encode() + data + b"\r\n"
-
-    field = "photo" if path.suffix.lower() == ".png" else "document"
-    method = "sendPhoto" if field == "photo" else "sendDocument"
-    body = b""
-    body += part('Content-Disposition: form-data; name="chat_id"', str(chat).encode())
-    body += part('Content-Disposition: form-data; name="caption"', caption.encode())
-    body += part(f'Content-Disposition: form-data; name="{field}"; filename="{path.name}"',
-                 path.read_bytes())
-    body += f"--{boundary}--\r\n".encode()
-    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}", data=body,
-                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-    try:
-        r = json.loads(urllib.request.urlopen(req, timeout=60).read().decode())
-        return "sent to Telegram" if r.get("ok") else f"Telegram answered: {str(r)[:120]}"
-    except Exception as e:
-        return f"Telegram refused: {e}"
-
-
-def finish_session(channels: dict[str, list[float]], sim: bool = False) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem = f"sim_ecg_{stamp}" if sim else f"ecg_{stamp}"
-    csv_path = DATA_DIR / f"{stem}.csv"
-    png_path = DATA_DIR / f"{stem}.png"
-    write_csv(channels, csv_path, source="simulate" if sim else "kardia-ble")
-    img = write_plot(channels, png_path, DATA_DIR / f"{stem}.pdf")
+def finish_session(channels: dict[str, list[float]], out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"ecg_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    csv_path = out_dir / f"{stem}.csv"
+    png_path = out_dir / f"{stem}.png"
+    write_csv(channels, csv_path)
+    img = write_plot(channels, png_path, out_dir / f"{stem}.pdf")
     metrics, note = read_metrics(channels)
-    seconds = len(channels["I"]) / SAMPLE_RATE
-    caption = f"KardiaMobile 6L ECG, {seconds:.0f} s\n{note}"
-    print(f"session {seconds:.0f} s -> {csv_path}")
+    print(f"session {len(channels['I']) / SAMPLE_RATE:.0f} s -> {csv_path}")
     print("metrics:", metrics or "none")
-    if sim:
-        # Dry run without hardware: never send to the owner, or synthetic data would
-        # arrive as if it were his ECG.
-        print("simulation run: nothing sent to Telegram or the webhook")
-        return
-    print("webhook:", post_metrics(metrics))
-    print(send_telegram(Path(img), caption))
+    print(note)
+    print("plot:", img)
 
 
 # ────────────────────────── Bluetooth ──────────────────────────
@@ -308,12 +234,10 @@ async def find_device(wait: float) -> object:
 def start_bond_agent():
     """Keep a Just Works agent alive for the duration of the session.
 
-    Without a bond the vendor characteristics answer ATT Error 5 and the link drops
-    with "Not connected" — verified on a live device. The BlueZ agent lives in the
-    bluetoothctl D-Bus session, so the process stays open until the recording ends.
+    Without a bond the vendor characteristics answer ATT Error 5 and the link drops;
+    verified on a live device. The agent lives in the bluetoothctl session, so the
+    process stays open until the recording is over.
     """
-    if os.environ.get("KARDIA_NO_BOND") == "1":
-        return None
     try:
         proc = subprocess.Popen(["bluetoothctl"], stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
@@ -338,10 +262,10 @@ def stop_bond_agent(proc) -> None:
 
 
 def pair_device(address: str) -> str:
-    """Explicit Just Works pairing (without a bond the device rejects subscriptions).
+    """Explicit Just Works pairing, before connecting.
 
-    Pairing must happen before connecting: then BlueZ brings encryption up on connect
-    and the vendor characteristics accept writes and subscriptions.
+    The device rejects writes and subscriptions until the link is encrypted, and BlueZ
+    does not start pairing by itself on the first GATT access.
     """
     proc = subprocess.Popen(["bluetoothctl"], stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
@@ -361,12 +285,13 @@ def pair_device(address: str) -> str:
     return "bond present" if "Bonded: yes" in out else "no bond"
 
 
-async def capture(seconds: float, auto: bool) -> dict[str, list[float]]:
+async def capture(seconds: float, auto: bool, wait: float = 1800.0, keep_raw: bool = False,
+                  raw_dir: Path | None = None) -> dict[str, list[float]]:
     from bleak import BleakClient
     if auto:
         # The device only advertises while fingers bridge the electrodes, so scan in
         # cycles instead of once — otherwise the 8-second window is missed.
-        deadline = time.monotonic() + float(os.environ.get("KARDIA_WAIT", "1800"))
+        deadline = time.monotonic() + wait
         target = None
         while time.monotonic() < deadline:
             target = await find_device(8.0)
@@ -378,17 +303,19 @@ async def capture(seconds: float, auto: bool) -> dict[str, list[float]]:
     if not target:
         return {}
     channels = {k: [] for k in ("I", "II", "III", "aVR", "aVL", "aVF")}
-    state = {"start": time.monotonic(), "active": False, "last_active": 0.0, "packets": 0}
+    state = {"active": False, "last_active": 0.0, "packets": 0}
 
-    raw_path = DATA_DIR / f"raw_ecg_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bin"
     raw_fp = None
-    if os.environ.get("KARDIA_RAW", "1") == "1":
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    raw_path = None
+    if keep_raw:
+        raw_dir = raw_dir or Path(".")
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = raw_dir / f"raw_ecg_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bin"
         raw_fp = raw_path.open("wb")
     buffer = bytearray()
 
     def on_ecg(_sender, data: bytearray) -> None:
-        # Keep the raw bytes: the channel layout gets settled from evidence, not guesses.
+        # Keep the raw bytes: the channel layout is settled from evidence, not guesses.
         if raw_fp is not None:
             raw_fp.write(bytes(data))
         buffer.extend(data)
@@ -400,10 +327,9 @@ async def capture(seconds: float, auto: bool) -> dict[str, list[float]]:
         # First element of a pair is the signal, second is a slow component.
         sig = [a for a, _ in pairs]
         spread = (max(sig) - min(sig)) if sig else 0
-        now = time.monotonic()
         if spread >= ACTIVITY_THRESHOLD:
             state["active"] = True
-            state["last_active"] = now
+            state["last_active"] = time.monotonic()
         if auto and not state["active"]:
             return
         for ch1, ch2 in pairs:
@@ -431,7 +357,8 @@ async def capture(seconds: float, auto: bool) -> dict[str, list[float]]:
         except Exception as e:
             print("could not write the command:", e)
         await client.start_notify(CHAR_ECG, on_ecg)
-        print(f"ECG stream on, recording {seconds:.0f} s" if not auto else "waiting for electrode contact...")
+        print(f"ECG stream on, recording {seconds:.0f} s" if not auto
+              else "waiting for electrode contact...")
         t0 = time.monotonic()
         while True:
             await asyncio.sleep(0.5)
@@ -460,28 +387,6 @@ async def capture(seconds: float, auto: bool) -> dict[str, list[float]]:
         print("raw stream:", raw_path)
     print(f"packets: {state['packets']}, samples: {len(channels['I'])}")
     return channels if channels["I"] else {}
-
-
-def simulate(seconds: float) -> dict[str, list[float]]:
-    """Synthetic stream: the same decoding path as live Bluetooth."""
-    channels = {k: [] for k in ("I", "II", "III", "aVR", "aVL", "aVF")}
-    random.seed(4)
-    total_packets = int(seconds * 100 / 3)
-    for p in range(total_packets):
-        payload = bytearray()
-        for s in range(SAMPLES_PER_PACKET):
-            idx = (p * SAMPLES_PER_PACKET + s) / SAMPLE_RATE
-            phase = (idx * 1.2) % 1.0
-            beat = math.exp(-((phase - 0.15) ** 2) / 0.0008) * 900 if phase < 0.4 else 0
-            ch1 = int(beat * 0.7 + random.gauss(0, 12))
-            ch2 = int(beat + random.gauss(0, 15))
-            payload += ch1.to_bytes(2, "little", signed=True) + ch2.to_bytes(2, "little", signed=True)
-        for ch1, ch2 in decode_m2(bytes(payload)):
-            channels["I"].append(float(ch1))
-            channels["II"].append(float(ch2))
-            for lead, val in derive_leads(ch1, ch2).items():
-                channels[lead].append(val)
-    return channels
 
 
 def selftest() -> int:
@@ -518,31 +423,31 @@ def selftest() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="KardiaMobile 6L ECG over Bluetooth")
     ap.add_argument("--scan", action="store_true")
-    ap.add_argument("--capture", type=float, default=0)
+    ap.add_argument("--capture", type=float, default=0, metavar="SEC")
     ap.add_argument("--auto", action="store_true")
-    ap.add_argument("--simulate", type=float, default=0)
+    ap.add_argument("--out", default=".", help="directory for the output files")
+    ap.add_argument("--wait", type=float, default=1800.0, metavar="SEC",
+                    help="how long to wait for the device in --auto")
+    ap.add_argument("--raw", action="store_true", help="also keep the raw notification bytes")
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--tool", default="", help="address or name to use if the wrong device is found")
     a = ap.parse_args()
     if a.selftest:
         return selftest()
     if a.scan:
         for r in asyncio.run(scan(15.0)):
-            print(f"{'*' if r['kardia'] else ' '} {r['name'] or '(no name)':28} {r['address']:20} RSSI {r['rssi']}")
+            print(f"{'*' if r['kardia'] else ' '} {r['name'] or '(no name)':28} "
+                  f"{r['address']:20} RSSI {r['rssi']}")
         return 0
-    if a.simulate:
-        ch = simulate(a.simulate)
-        sim = True
-    elif a.capture or a.auto:
-        ch = asyncio.run(capture(a.capture or MAX_SESSION_SECONDS, a.auto))
-        sim = False
-    else:
+    if not (a.capture or a.auto):
         ap.print_help()
         return 2
+    out = Path(a.out)
+    ch = asyncio.run(capture(a.capture or MAX_SESSION_SECONDS, a.auto, wait=a.wait,
+                             keep_raw=a.raw, raw_dir=out if a.raw else None))
     if not ch or not ch["I"]:
         print("no recording")
         return 1
-    finish_session(ch, sim)
+    finish_session(ch, out)
     return 0
 
 

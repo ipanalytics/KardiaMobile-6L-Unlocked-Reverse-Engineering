@@ -49,6 +49,8 @@ The same device emits 20-byte frames (5 pairs) at MTU 23 and 36-byte frames (9 p
 
 The app uploads the recording and hands back a multi-page PDF. Whatever you get there is a presentation of the data, not the data. If you are reading the raw stream yourself, take it from the stream.
 
-## Synthetic data must be labelled
+## Testing without the device
 
-A `--simulate` mode is useful to test plotting and storage without holding the device. Mark it everywhere — in the log, in the CSV header and in the filename — so that a synthetic trace can never end up in a health record looking like a real measurement.
+To test the decoder and the plotting without holding the device, feed a recorded dump
+through `tools/kardia_decode.py` — it takes the raw notification bytes and never touches
+Bluetooth.
