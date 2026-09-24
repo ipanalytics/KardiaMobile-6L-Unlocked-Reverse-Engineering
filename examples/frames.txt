@@ -1,0 +1,18 @@
+# Captured frames from a KardiaMobile 6L stream, hex, comments allowed.
+# Values are little-endian int16 pairs (ch1, ch2), ~300 pairs per second.
+# One pair = 4 bytes, so a frame of N pairs is 4*N bytes = 8*N hex characters.
+#
+# A full frame: 9 pairs = 36 bytes (raised MTU):
+c5f9a9f7adf9a9f7b5f98df7e5f999f7b9f99df7c5f9a1f7b5f9a1f7c1f99df7d5f99df7
+#
+# On a stock 23-byte MTU the device trims the same stream to 5 pairs = 20 bytes:
+a9f7adf9b5f98df7e5f999f7b9f99df7c5f9a1f7
+#
+# Two consecutive trimmed frames must decode as ten pairs, not five:
+a9f7adf9b5f98df7e5f999f7b9f99df7c5f9a1f7a9f7adf9b5f98df7e5f999f7b9f99df7c5f9a1f7
+#
+# Electrodes open: the front end saturates at the ADC maximum (0x6599 = 26009):
+9965996599659965
+#
+# The unlock command for the example name "Kardia6L ABCD" (20 ASCII bytes):
+4d32204b66656161373235353132326439343866
